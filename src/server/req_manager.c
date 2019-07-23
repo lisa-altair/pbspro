@@ -3847,6 +3847,11 @@ struct batch_request *preq;
 				}
 			}
 		}
+		/* license this node */
+		if (sockets_consume(1) == 0) {
+			set_attr_svr(&pnode->nd_attr[(int) ND_ATR_License],
+				&node_attr_def[(int) ND_ATR_License],
+				ND_LIC_locked_str);
 	}
 	mgr_log_attr(msg_man_set, plist,
 		PBS_EVENTCLASS_NODE, preq->rq_ind.rq_manager.rq_objname, NULL);
