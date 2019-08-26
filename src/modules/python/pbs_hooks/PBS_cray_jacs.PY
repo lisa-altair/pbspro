@@ -166,6 +166,36 @@ class HookHelper(object):
         log_with_caller(pbs.EVENT_DEBUG4, 'path is %s' % path)
         return path
 
+    @staticmethod
+    def get_token_header():
+        """
+        Get the authorization token from a file.
+        Put it in a form to be used in the URL header.
+        """
+        log_function_name()
+        token_file = "/etc/opt/cray/tokens/access"
+        try:
+            with open(token_file, "r") as file:
+                contents = file.read()
+        except IOError:
+            log_with_caller(pbs.EVENT_ERROR, 'Failed to read the Auth token')
+            return None
+
+        file_as_list = contents.splitlines()
+        d = dict(s.split('=') for s in file_as_list)
+        token = d.get("access_token")
+        return token
+
+def request(method, url, **kwargs):
+    """
+    Constructs and sends a :class:`Request <Request>`.
+    """
+    header = None
+    token = HookHelper.get_token_header()
+    if token:
+        bearer = "Bearer %s" % token
+        header = {"Authorization" : bearer}
+    return requests.request(method=method, url=url, headers=header, **kwargs)
 
 def post(url, json=None, **kwargs):
     """
@@ -176,7 +206,7 @@ def post(url, json=None, **kwargs):
     log_with_caller(pbs.EVENT_DEBUG2, 'Sending POST to %s' % url, caller=1)
     log_with_caller(pbs.EVENT_DEBUG2, 'Sending POST JSON: %s' %
                     JSON.dumps(json), caller=1)
-    r = requests.post(url, json=json, **kwargs)
+    r = request('post', url, json=json, **kwargs)
     log_with_caller(pbs.EVENT_DEBUG2, 'Received POST status code = %s' %
                     r.status_code, caller=1)
     log_with_caller(pbs.EVENT_DEBUG2, 'Received POST text %s' %
@@ -194,7 +224,7 @@ def get(url, params=None, **kwargs):
     if params:
         log_with_caller(pbs.EVENT_DEBUG2,
                         'Sending GET params: %s' % params, caller=1)
-    r = requests.get(url, params=params, **kwargs)
+    r = request('get', url, params=params, **kwargs)
     log_with_caller(pbs.EVENT_DEBUG2, 'Received GET status code = %s' %
                     r.status_code, caller=1)
     log_with_caller(pbs.EVENT_DEBUG2, 'Received GET text %s' %
@@ -209,7 +239,7 @@ def delete(url, **kwargs):
     Logs before and after
     """
     log_with_caller(pbs.EVENT_DEBUG2, 'Sending DELETE to %s' % url, caller=1)
-    r = requests.delete(url, **kwargs)
+    r = request('delete', url, **kwargs)
     log_with_caller(pbs.EVENT_DEBUG2, 'Received DELETE status code = %s' %
                     r.status_code, caller=1)
     log_with_caller(pbs.EVENT_DEBUG2, 'Received DELETE text %s' %
