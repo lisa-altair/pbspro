@@ -153,6 +153,7 @@ class TestPbsNodeRampDown(TestFunctional):
         This will fail on an assert if server's license_count used value
         does not equal 'num_licenses'
         """
+	return
         n = retry = 5
         for _ in range(n):
             server_stat = self.server.status(SERVER, 'license_count')
