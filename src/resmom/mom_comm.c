@@ -550,6 +550,8 @@ task_check(job *pjob, int fd, tm_task_id taskid)
 	int		i;
 	pbs_task	*ptask;
 
+	sprintf(log_buffer, "$MLIU task_find %8.8X", taskid);
+	log_joberr(-1, __func__, log_buffer, pjob->ji_qs.ji_jobid);
 	ptask = task_find(pjob, taskid);
 	if (ptask == NULL) {
 		sprintf(log_buffer, "requesting task %8.8X not found",
@@ -3061,6 +3063,7 @@ im_request(int stream, int version)
 			 ** )
 			 */
 			reply = 1;
+			log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_DEBUG, jobid, "#mliu before im_join_job");
 			if (check_ms(stream, NULL))
 				goto fini;
 
@@ -3502,6 +3505,9 @@ join_err:
 	 ** reply == 1 means that this is a request to which a reply may happen
 	 */
 	if (reply == 0) {
+		sprintf(log_buffer, "$MLIU received a reply: command=%d, event=%d, fromtask=%d", command, event, fromtask);
+		log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_DEBUG, jobid, log_buffer);
+
 		for (nodeidx = 0; nodeidx < pjob->ji_numnodes; nodeidx++) {
 			np = &pjob->ji_hosts[nodeidx];
 
@@ -3550,6 +3556,11 @@ join_err:
 		event_client = ep->ee_client;
 		argv = ep->ee_argv;
 		envp = ep->ee_envp;
+		// MLIU TODO : so once we receive a reply we delete an event entry, cool
+		if (ep->ee_command == IM_SPAWN_MULTI) {
+			sprintf(log_buffer, "$MLIU I found one event for IM_SPAWN_MULTI reply, and deleting a link");
+			log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_DEBUG, jobid, log_buffer);
+		}
 		delete_link(&ep->ee_next);
 		free(ep);
 	}
@@ -3568,6 +3579,7 @@ join_err:
 			 **	none;
 			 ** )
 			 */
+			log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_DEBUG, jobid, "#mliu before im_kill_job");
 			if (check_ms(stream, pjob))
 				goto fini;
 
@@ -3629,7 +3641,7 @@ join_err:
 			 ** )
 			 */
 			DBPRT(("%s: %s for %s\n", __func__, command==IM_DELETE_JOB?"DELETE_JOB":"DELETE_JOB_REPLY", pjob->ji_qs.ji_jobid));
-
+			log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_DEBUG, jobid, "#mliu before im_delete_job_reply");
 			if (check_ms(stream, pjob))
 				goto fini;
 
@@ -3820,6 +3832,10 @@ join_err:
 			 **	envp m		string
 			 ** )
 			 */
+
+			sprintf(log_buffer, "@@MLIU IM_SPAWN_TASK received, fromtask=%d", fromtask);
+			log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_DEBUG, jobid, log_buffer);
+
 			pvnodeid = disrsi(stream, &ret);
 			BAIL("SPAWN_TASK pvnodeid")
 
@@ -3941,10 +3957,175 @@ join_err:
 				SEND_ERR(errcode)
 			}
 			else {
+				sprintf(log_buffer, "@@MLIU I started a task, replying IM_ALL_OKAY to ms, ep taskid %8.8X", fromtask);
+				log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_DEBUG, jobid, log_buffer);
 				ret = im_compose(stream, jobid, cookie, IM_ALL_OKAY,
 					event, fromtask, IM_OLD_PROTOCOL_VER);
 				if (ret != DIS_SUCCESS)
 					break;
+				sprintf(log_buffer, "@@MLIU sending taskid=%8.8X", ptask->ti_qs.ti_task);
+				log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_DEBUG, jobid, log_buffer);	
+				ret = diswui(stream, ptask->ti_qs.ti_task);
+			}
+
+			arrayfree(argv);
+			arrayfree(envp);
+			break;
+
+		case	IM_SPAWN_MULTI:
+			/*
+			 ** Sender is a MOM in a job that wants to start a task.
+			 ** I am MOM on the node that is to run the task.
+			 **
+			 ** auxiliary info (
+			 **	parent vnode	tm_node_id
+			 **	target vnode	tm_node_id
+			 **	task id		tm_task_id (not used)
+			 **	argv 0		string
+			 **	...
+			 **	argv n		string
+			 **	null
+			 **	envp 0		string
+			 **	...
+			 **	envp m		string
+			 ** )
+			 */
+			sprintf(log_buffer, "#MLIU IM_SPAWN_MULTI received, fromtask %d", fromtask);
+			log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_DEBUG, jobid, log_buffer);
+			pvnodeid = disrsi(stream, &ret);
+			BAIL("SPAWN_MULTI pvnodeid")
+
+			if ((np = find_node(pjob, stream, pvnodeid)) == NULL) {
+				SEND_ERR(PBSE_BADHOST)
+				break;
+			}
+			tvnodeid = disrsi(stream, &ret);
+			BAIL("SPAWN_MULTI tvnodeid")
+			taskid = disrui(stream, &ret);
+			BAIL("SPAWN_MULTI taskid")
+			DBPRT(("%s: SPAWN_MULTI %s parent %d target %d taskid %u\n",
+				__func__, jobid, pvnodeid, tvnodeid, taskid))
+
+			/*
+			 **	The target node must be here.
+			 */
+			if (pjob->ji_nodeid != TO_PHYNODE(tvnodeid)) {
+				/* MLIU failed here interesting */
+				sprintf(log_buffer, "#MLIU target node %d is not me %d", TO_PHYNODE(tvnodeid), pjob->ji_nodeid);
+				log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_DEBUG, jobid, log_buffer);
+				SEND_ERR(PBSE_INTERNAL)
+				break;
+			}
+
+			if( version == IM_OLD_PROTOCOL_VER) {
+				/*
+				 * The arg list is ended by an empty (zero length)
+				 * string.
+				 */
+				num = 4;
+				argv = (char **)calloc(sizeof(char *), num);
+				assert(argv);
+				for (i=0;; i++) {
+					if ((cp = disrst(stream, &ret)) == NULL)
+						break;
+					if (ret != DIS_SUCCESS)
+						break;
+					if (*cp == '\0') {
+						/* got a empty string, end of args lits */
+						free(cp);
+						break;
+					}
+					if (i == num-1) {
+						num *= 2;
+						argv = (char **)realloc(argv,
+						num*sizeof(char *));
+						assert(argv);
+					}
+					argv[i] = cp;
+				}
+			} else {
+			  	argc = disrui(stream, &ret);
+				if (ret != DIS_SUCCESS) {
+					sprintf(log_buffer, "SPAWN_MULTI read of argc");
+					goto err;
+				}
+				argv = (char **)calloc(argc+1, sizeof(char *));
+				assert(argv);
+				for (i=0; i<argc; i++) {
+					argv[i] = disrst(stream, &ret);
+					if (ret != DIS_SUCCESS)
+						break;
+				}
+			}
+			argv[i] = NULL;
+			if (ret != DIS_SUCCESS) {
+				arrayfree(argv);
+				sprintf(log_buffer, "SPAWN_MULTI read of argv array");
+				goto err;
+			}
+
+			num = 8;
+			envp = (char **)calloc(sizeof(char *), num);
+			assert(envp);
+			for (i=0;; i++) {
+				if ((cp = disrst(stream, &ret)) == NULL)
+					break;
+				if (ret != DIS_SUCCESS)
+					break;
+				if (*cp == '\0') {
+					free(cp);
+					break;
+				}
+				if (i == num-1) {
+					num *= 2;
+					envp = (char **)realloc(envp,
+						num*sizeof(char *));
+					assert(envp);
+				}
+				envp[i] = cp;
+			}
+			envp[i] = NULL;
+			if (ret != DIS_EOD) {
+				arrayfree(argv);
+				arrayfree(envp);
+				sprintf(log_buffer, "SPAWN_MULTI read of envp array");
+				goto err;
+			}
+#ifdef PMIX
+			pbs_pmix_register_client(pjob, tvnodeid, &envp);
+#endif
+			ret = DIS_SUCCESS;
+			if ((ptask = momtask_create(pjob)) == NULL) {
+				SEND_ERR(PBSE_SYSTEM);
+				arrayfree(argv);
+				arrayfree(envp);
+				break;
+			}
+			strcpy(ptask->ti_qs.ti_parentjobid, jobid);
+			ptask->ti_qs.ti_parentnode = pvnodeid;
+			ptask->ti_qs.ti_myvnode    = tvnodeid;
+			ptask->ti_qs.ti_parenttask = fromtask;
+			if (task_save(ptask) == -1) {
+				SEND_ERR(PBSE_SYSTEM)
+				arrayfree(argv);
+				arrayfree(envp);
+				break;
+			}
+			sprintf(log_buffer, "#MLIU hey look I started a task");
+			log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_DEBUG, jobid, log_buffer);
+			errcode = start_process(ptask, argv, envp, false);
+			if (errcode != PBSE_NONE) {
+				SEND_ERR(errcode)
+			}
+			else {
+				sprintf(log_buffer, "#MLIU sending a IM_ALL_OKAY reply back to MS, ep taskid %8.8X", fromtask);
+				log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_DEBUG, jobid, log_buffer);
+				ret = im_compose(stream, jobid, cookie, IM_ALL_OKAY,
+					event, fromtask, IM_OLD_PROTOCOL_VER);
+				if (ret != DIS_SUCCESS)
+					break;
+				sprintf(log_buffer, "#MLIU sending task id with the reply, taskid=%8.8X", ptask->ti_qs.ti_task);
+				log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_DEBUG, jobid, log_buffer);
 				ret = diswui(stream, ptask->ti_qs.ti_task);
 			}
 
@@ -4159,7 +4340,9 @@ join_err:
 					sleep(90);
 			}
 
-			if (check_ms(stream, pjob))
+			sprintf(log_buffer, "#MLIU received a IM POLL JOB request");
+			log_event(PBSEVENT_ERROR, PBS_EVENTCLASS_JOB, LOG_NOTICE, pjob->ji_qs.ji_jobid, log_buffer);
+			if (check_ms(stream, pjob))  /* MLIU TODO or is it here ? */
 				goto fini;
 			pjob->ji_polltime = time_now;
 			DBPRT(("%s: POLL_JOB %s\n", __func__, jobid))
@@ -4229,6 +4412,7 @@ join_err:
 			 **	none;
 			 ** )
 			 */
+			log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_DEBUG, jobid, "#mliu before im_resume");
 			if (check_ms(stream, pjob))
 				goto fini;
 			DBPRT(("%s: %s %s\n", __func__, (command == IM_SUSPEND) ?
@@ -4271,6 +4455,7 @@ join_err:
 			 **	none;
 			 ** )
 			 */
+			log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_DEBUG, jobid, "#mliu before im_restart");
 			if (check_ms(stream, pjob))
 				goto fini;
 			DBPRT(("%s: RESTART %s\n", __func__, jobid))
@@ -4343,6 +4528,7 @@ join_err:
 			 **	none;
 			 ** )
 			 */
+			log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_DEBUG, jobid, "#mliu before im_checkpoint_abort");
 			if (check_ms(stream, pjob))
 				goto fini;
 			DBPRT(("%s: %s %s\n", __func__,
@@ -4387,6 +4573,7 @@ join_err:
 			 **	none;
 			 ** )
 			 */
+			log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_DEBUG, jobid, "#mliu before im_abort_job");
 			if (check_ms(stream, pjob))
 				goto fini;
 			DBPRT(("%s: ABORT_JOB %s\n", __func__, jobid))
@@ -4439,6 +4626,7 @@ join_err:
 			 **	... dependent
 			 ** )
 			 */
+			log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_DEBUG, jobid, "#mliu before im_setup_job");
 			if (check_ms(stream, pjob))
 				goto fini;
 			DBPRT(("%s: SETUP_JOB %s\n", __func__, jobid))
@@ -4708,6 +4896,7 @@ join_err:
 					chk_del_job(pjob, 0);
 					break;
 
+				// MLIU TODO, this is where I get the reply to IM_SPAWN_TASK, cool
 				case	IM_SPAWN_TASK:
 					/*
 					 ** Sender is MOM responding to a "spawn_task"
@@ -4717,17 +4906,77 @@ join_err:
 					 **	task id		tm_task_id;
 					 ** )
 					 */
+					log_joberr(-1, __func__, "@@MLIU IM_ALL_OKAY reply for IM_SPAWN_TASK received", jobid);
 					taskid = disrui(stream, &ret);
 					BAIL("OK-SPAWN taskid")
 					DBPRT(("%s: SPAWN_TASK %s OKAY task %8.8X\n",
 						__func__, jobid, taskid))
+					sprintf(log_buffer, "@@MLIU taskid = disrui = %8.8X", taskid);
+					log_joberr(-1, __func__, log_buffer, jobid);
+					sprintf(log_buffer, "@@MLIU right now the event_task = %8.8X", event_task);
+					log_joberr(-1, __func__, log_buffer, jobid);
 					ptask = task_check(pjob, efd, event_task);
 					if (ptask == NULL)
 						break;
+					log_joberr(-1, __func__, "@@MLIU task_check passed, sending reply to client", jobid);
 					(void)tm_reply(efd, ptask->ti_protover,
 						TM_OKAY, event_client);
 					(void)diswui(efd, taskid);
 					(void)dis_flush(efd);
+					break;
+
+				case	IM_SPAWN_MULTI:
+					/*
+					 * Sender is a MOM responding to a "spawn_multi"
+					 * request
+					 * 
+					 */
+					log_joberr(-1, __func__, "#MLIU IM_ALL_OKAY reply for IM_SPAWN_MULTI received", jobid);
+					taskid = disrui(stream, &ret);
+					BAIL("OK-SPAWN taskid")
+					DBPRT(("%s: SPAWN_TASK %s OKAY task %8.8X\n",
+						__func__, jobid, taskid))
+
+					sprintf(log_buffer, "#MLIU taskid = disrui = %8.8X", taskid);
+					log_joberr(-1, __func__, log_buffer, jobid);
+					sprintf(log_buffer, "#MLIU right now the event_task = %8.8X", event_task);
+					log_joberr(-1, __func__, log_buffer, jobid);
+
+					/* MLIU skip checking for task for now */
+					// ptask = task_check(pjob, efd, taskid);
+					// if (ptask == NULL)
+					// 	break;
+
+					/* 
+					 * delete one of the events not necessary
+					 * this was done above the switch already
+					 */
+					sprintf(log_buffer, "#MLIU looking for events on nodes");
+					log_joberr(-1, __func__, log_buffer, jobid);
+					/* if no more events found, reply back to client */
+					for (i=0; i<pjob->ji_numnodes; i++) {
+						hnodent *xp = &pjob->ji_hosts[i];
+						if ((ep = (eventent *)GET_NEXT(xp->hn_events)) != NULL)
+							break;
+					}
+
+					if ((nodeidx > 0) && (nodeidx < pjob->ji_numnodes)) {
+						char *hn;
+						hn  = pjob->ji_hosts[nodeidx].hn_host;
+						snprintf(log_buffer, sizeof(log_buffer),
+						"#MLIU received IM_ALL_OK spawn multi from host %s", hn?hn:"");
+						log_joberr(-1, __func__, log_buffer, jobid);
+					}
+	
+					if (ep == NULL) {	/* no more events */
+						sprintf(log_buffer, "#MLIU no more events found, yeah!");
+						log_joberr(-1, __func__, log_buffer, jobid);
+						// (void)tm_reply(efd, ptask->ti_protover, TM_OKAY, event_client); // efd needs to be fd to pbsdsh, event client needs to be pbsdsh
+						// (void)diswui(efd, taskid);
+						// (void)dis_flush(efd);
+						// sprintf(log_buffer, "#MLIU after rm_reply(efd ...)");
+						// log_joberr(-1, __func__, log_buffer, jobid);
+					}
 					break;
 
 				case	IM_GET_TASKS:
@@ -5276,6 +5525,11 @@ join_err:
 					(void)diswsi(efd, errcode);
 					(void)dis_flush(efd);
 					break;
+				
+				case	IM_SPAWN_MULTI:
+					sprintf(log_buffer, "#MLIU IM_ERROR for IM_SPAWN_MULTI received, errcode = %d", errcode);
+					log_joberr(-1, __func__, log_buffer, jobid);
+					break;
 
 				case	IM_POLL_JOB:
 					/*
@@ -5426,6 +5680,7 @@ join_err:
 			break;
 
 		case	IM_UPDATE_JOB:
+		log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_DEBUG, jobid, "#mliu before im_update_job");
 			if (check_ms(stream, NULL))
 				goto fini;
 			if (receive_job_update(stream, pjob) != 0) {
@@ -6086,6 +6341,11 @@ aterr:
 	/* set no timeout so connection is not closed for being idle */
 	conn->cn_authen |= PBS_NET_CONN_NOTIMEOUT;
 
+	/* MLIU var declartions */
+	int list_size, c, j, num = 0, mtfd = -1;
+	tm_node_id *node_list;
+	eventent *nep;
+
 	switch (command) {
 
 		case TM_INIT:
@@ -6169,12 +6429,327 @@ aterr:
 			(void)dis_flush(fd);
 			goto err;
 
+		case TM_SPAWN_MULTI:
+			/*
+			 ** Spawn multiple tasks on the requested nodes.
+			 **
+			 **	read (
+			 **     list_size		int;
+			 **     node1
+			 **     ...
+			 **     node2
+			 **		argc		int;
+			 **		arg 0		string;
+			 **		...
+			 **		arg argc-1	string;
+			 **		env 0		string;
+			 **		...
+			 **		env m		string;
+			 **	)
+			 */
+			// DBPRT(("%s: SPAWN_MULTI %s\n", __func__, jobid))
+			/* read list size */
+			sprintf(log_buffer, "#MLIU TM_SPAWN_MULTI received, fromtask %d", fromtask);
+			log_joberr(-1, __func__, log_buffer, jobid);
+			list_size = disrsi(fd, &ret);
+			if (ret != DIS_SUCCESS)
+				goto done;
+			sprintf(log_buffer, "#MLIU list_size = %d", list_size);
+			log_joberr(-1, __func__, log_buffer, jobid);
+
+			node_list = (tm_node_id *)calloc(list_size, sizeof(tm_node_id));
+			/* read where, a list of nodes */
+			for (i = 0; i < list_size; i++) {
+				node_list[i] = disrsi(fd, &ret);
+				if (ret != DIS_SUCCESS) {
+					free(node_list);
+					goto done;
+				}
+				sprintf(log_buffer, "#MLIU node_list[%d] =  %d", i, node_list[i]);
+				log_joberr(-1, __func__, log_buffer, jobid);
+			}
+			/* read argv */
+			argc = disrui(fd, &ret);
+			if (ret != DIS_SUCCESS)
+				goto done;
+			sprintf(log_buffer, "#MLIU argc = %d", argc);
+			log_joberr(-1, __func__, log_buffer, jobid);
+			/* read argv */
+			argv = (char **)calloc(argc + 1, sizeof(char *));
+			assert(argv);
+			for (i = 0; i < argc; i++) {
+				argv[i] = disrst(fd, &ret);
+				if (ret != DIS_SUCCESS) {
+					argv[i] = NULL;
+					arrayfree(argv);
+					goto done;
+				}
+				if(strlen(argv[i]) == 0)
+				  	found_empty_string = 1;  /* arguments contains empty string, Used if spawn on another MOM*/
+				sprintf(log_buffer, "#MLIU argv[%d] = %s", i, argv[i]);
+				log_joberr(-1, __func__, log_buffer, jobid);
+			}
+			argv[i] = NULL;
+
+			numele = 3;
+			envp = (char **)calloc(numele, sizeof(char *));
+			assert(envp);
+			for (i = 0; ; i++) {
+				char	*env;
+
+				env = disrst(fd, &ret);
+				if (ret != DIS_SUCCESS && ret != DIS_EOD) {
+					arrayfree(argv);
+					envp[i] = NULL;
+					arrayfree(envp);
+					goto done;
+				}
+				if (env == NULL)
+					break;
+				if (*env == '\0') {
+					free(env);
+					break;
+				}
+				/*
+				 **	Need to remember extra slot for NULL
+				 **	at the end.  Thanks to Pete Wyckoff
+				 **	for finding this.
+				 */
+				if (i == numele-1) {
+					numele *= 2;
+					envp = (char **)realloc(envp,
+						numele*sizeof(char *));
+					assert(envp);
+				}
+				envp[i] = env;
+				sprintf(log_buffer, "#MLIU envp[%d] = %s", i, envp[i]);
+				log_joberr(-1, __func__, log_buffer, jobid);
+			}
+			envp[i] = NULL;
+			ret = DIS_SUCCESS;
+
+			if (prev_error) {
+				free(node_list);
+				arrayfree(argv);
+				arrayfree(envp);
+				goto done;
+			}
+			if (pbs_conf.pbs_use_mcast == 1) {
+				/* open the tpp mcast channel here */
+				if ((mtfd = tpp_mcast_open()) == -1) {
+					sprintf(log_buffer, "mcast open failed");
+					log_joberr(-1, __func__, log_buffer, jobid);
+					goto err;
+				}
+			}
+
+			for (i = 0; i < list_size; i++) {
+				tvnodeid = node_list[i];
+				/* check node number is legal */
+				pnode = pjob->ji_vnods;
+				for (j = 0; j < pjob->ji_numvnod; j++, pnode++) {
+					if (pnode->vn_node == tvnodeid)
+						break;
+				}
+				if (j == pjob->ji_numvnod) {
+					sprintf(log_buffer, "node %d not found", tvnodeid);
+					log_joberr(-1, __func__, log_buffer, jobid);
+					ret = tm_reply(fd, version, TM_ERROR, event);
+					if (ret != DIS_SUCCESS)
+						goto done;
+					ret = diswsi(fd, TM_ENOTFOUND);
+					if (ret != DIS_SUCCESS)
+						goto done;
+					prev_error = 1;
+				}
+				phost = pnode->vn_host;
+
+				sprintf(log_buffer, "#MLIU iterating node %d, TOPHY=%d, I am %d", tvnodeid, TO_PHYNODE(tvnodeid), pjob->ji_nodeid);
+				log_joberr(-1, __func__, log_buffer, jobid);
+
+				/* If the spawn happens on me, just do it */
+				if (pjob->ji_nodeid == TO_PHYNODE(tvnodeid)) {
+/* not sure what to do with pmix yet */
+#ifdef PMIX
+					pbs_pmix_register_client(pjob, tvnodeid, &envp);
+#endif
+					c = TM_ERROR;
+					ptask = momtask_create(pjob);
+					if (ptask != NULL) {
+						strcpy(ptask->ti_qs.ti_parentjobid, jobid);
+						ptask->ti_qs.ti_parentnode = myvnodeid;
+						ptask->ti_qs.ti_myvnode = tvnodeid;
+						ptask->ti_qs.ti_parenttask = fromtask;
+						if (task_save(ptask) != -1) {
+							ret = start_process(ptask, argv, envp, false);
+							if (ret == PBSE_NONE) {
+								c = TM_OKAY;
+							} else if (ret == PBSE_SYSTEM) {
+								c = TM_ESYSTEM;
+								ptask->ti_qs.ti_status = TI_STATE_EXITED;
+							}
+						}
+					}
+
+					sprintf(log_buffer, "#MLIU hey i spawned a task on myself: %d", tvnodeid);
+					log_joberr(-1, __func__, log_buffer, jobid);
+					
+					/* not done yet, no rush to reply */
+					
+				} else {
+					/* send to another mom */
+					sprintf(log_buffer, "#MLIU I am sending to %d", tvnodeid);
+					log_joberr(-1, __func__, log_buffer, jobid);
+
+					/* the host of current vnode is phost, use phost */
+					if (phost->hn_stream == -1)
+						phost->hn_stream = tpp_open(phost->hn_host, phost->hn_port);
+					if (phost->hn_stream < 0) {
+						sprintf(log_buffer, "tpp_open failed on %s:%d",
+							phost->hn_host, phost->hn_port);
+						log_joberr(-1, __func__, log_buffer, jobid);
+						continue;
+					}
+			
+					if (pbs_conf.pbs_use_mcast == 1) {
+						/* add each of the tpp streams to the tpp mcast channel */
+						if (tpp_mcast_add_strm(mtfd, phost->hn_stream) == -1) {
+							tpp_close(phost->hn_stream);
+							phost->hn_stream = -1;
+							sprintf(log_buffer, "mcast add node %d failed", tvnodeid);
+							log_joberr(-1, __func__, log_buffer, jobid);
+							continue;
+						}
+					}
+
+					/* MLIU TODO this is where I am not sure what to fill in */
+					if (nep == NULL) {
+						nep = event_alloc(pjob, IM_SPAWN_MULTI, fd, phost,
+							TM_NULL_EVENT, TM_NULL_TASK);
+						ep = nep;
+					} else {
+						ep = event_dup(nep, pjob, phost);
+					}
+					if (ep == NULL) {
+						sprintf(log_buffer, "failed to create event for %s",
+								phost->hn_host?phost->hn_host:"node");
+						log_err(errno, __func__, log_buffer);
+						tpp_close(phost->hn_stream);
+						phost->hn_stream = -1;
+						continue;
+					}
+					sprintf(log_buffer, "#MLIU alloc new event %d, taskid %8.8X on host %s", ep->ee_event, fromtask, pnode->vn_hname);
+					log_joberr(-1, __func__, log_buffer, jobid);
+					// if (pjob->ji_nodekill == phost->hn_node)
+					// 	pjob->ji_nodekill = TM_ERROR_NODE;
+					
+					// phost->hn_sister = SISTER_OKAY;
+					num++;
+				}
+			} /* end of for loop */
+
+			if (pbs_conf.pbs_use_mcast == 1 && num > 0) {
+				ret = im_compose(mtfd, pjob->ji_qs.ji_jobid, get_jattr_str(pjob, JOB_ATR_Cookie),
+							IM_SPAWN_MULTI, ep->ee_event, TM_NULL_TASK,
+							found_empty_string ? IM_PROTOCOL_VER : IM_OLD_PROTOCOL_VER);
+				/* send body of message, argc, argv, env etc. */
+				if (ret != DIS_SUCCESS) {
+					arrayfree(argv);
+					arrayfree(envp);
+					tpp_mcast_close(mtfd);
+					goto done;
+				}
+
+				/*
+				** Here we send any extra information that needs
+				** to follow the standard set.
+				** There was a np being passed, have to think what to do about that
+				*/
+				ret = diswui(mtfd, myvnodeid);
+				if (ret != DIS_SUCCESS) {
+					arrayfree(argv);
+					arrayfree(envp);
+					goto done;
+				}
+				ret = diswui(mtfd, tvnodeid);
+				if (ret != DIS_SUCCESS) {
+					arrayfree(argv);
+					arrayfree(envp);
+					goto done;
+				}
+				ret = diswui(mtfd, TM_NULL_TASK);
+				if (ret != DIS_SUCCESS) {
+					arrayfree(argv);
+					arrayfree(envp);
+					goto done;
+				}
+				if (found_empty_string) {
+					ret = diswui(mtfd, argc);
+					if (ret != DIS_SUCCESS) {
+						arrayfree(argv);
+						arrayfree(envp);
+						goto done;
+					}
+					for (i = 0; i < argc; i++) {
+						ret = diswst(mtfd, argv[i]);
+						if (ret != DIS_SUCCESS) {
+							arrayfree(argv);
+							arrayfree(envp);
+							goto done;
+						}
+					}
+				} else {
+					for (i = 0; argv[i]; i++) {
+						ret = diswst(mtfd, argv[i]);
+						if (ret != DIS_SUCCESS) {
+							arrayfree(argv);
+							arrayfree(envp);
+							goto done;
+						}
+					}
+					ret = diswst(mtfd, "");
+					if (ret != DIS_SUCCESS) {
+						arrayfree(argv);
+						arrayfree(envp);
+						goto done;
+					}
+				}
+				for (i = 0; envp[i]; i++) {
+					ret = diswst(mtfd, envp[i]);
+					if (ret != DIS_SUCCESS) {
+						arrayfree(argv);
+						arrayfree(envp);
+						goto done;
+					}
+				}
+				ret = (dis_flush(mtfd) == -1) ?
+					DIS_NOCOMMIT : DIS_SUCCESS;
+				if (ret != DIS_SUCCESS) {
+					arrayfree(argv);
+					arrayfree(envp);
+					goto done;
+				}
+				ret = dis_flush(mtfd);
+				if (ret != DIS_SUCCESS) {
+					close_sisters_mcast(pjob);
+					tpp_mcast_close(mtfd);
+					return 0;
+				}
+				// reply = 1;
+				tpp_mcast_close(mtfd);
+			}
+			arrayfree(argv);
+			arrayfree(envp);
+
+			goto done;
+			break;
+
 		default:
 			break;
 	}
 
-	/*
-	 ** All requests beside TM_INIT and TM_POSTINFO
+	/* 
+	 ** All requests beside TM_INIT, TM_POSTINFO and TM_SPAWN_MULTI
 	 ** require a node number where the action will take place.
 	 ** Read that and check that it is legal.
 	 **
@@ -6249,6 +6824,7 @@ aterr:
 			ret = diswui(fd, TM_NULL_TASK);
 			break;
 
+		// MLIU TODO
 		case TM_SPAWN:
 			/*
 			 ** Spawn a task on the requested node.
@@ -6263,6 +6839,7 @@ aterr:
 			 **		env m		string;
 			 **	)
 			 */
+			sprintf(log_buffer, "#@@LIU TM_SPAWN received, fromtask %d", fromtask);
 			DBPRT(("%s: SPAWN %s on node %d\n",
 				__func__, jobid, tvnodeid))
 			argc = disrui(fd, &ret);
@@ -6330,6 +6907,8 @@ aterr:
 #ifdef PMIX
 				pbs_pmix_register_client(pjob, tvnodeid, &envp);
 #endif
+				sprintf(log_buffer, "@@MLIU I am spawning a task on myself %d", tvnodeid);
+				log_joberr(-1, __func__, log_buffer, jobid);
 				i = TM_ERROR;
 				ptask = momtask_create(pjob);
 				if (ptask != NULL) {
@@ -6360,8 +6939,12 @@ aterr:
 			/*
 			 ** Sending to another MOM.
 			 */
+			sprintf(log_buffer, "@@MLIU I am sending to node %d", tvnodeid);
+			log_joberr(-1, __func__, log_buffer, jobid);
 			ep = event_alloc(pjob, IM_SPAWN_TASK, fd, phost,
 				event, fromtask);
+			sprintf(log_buffer, "@@MLIU alloc new event %d, taskid %8.8X, on host %s", ep->ee_event, fromtask, phost);
+			log_joberr(-1, __func__, log_buffer, jobid);
 			ret = im_compose(phost->hn_stream, jobid, cookie,
 					 IM_SPAWN_TASK, ep->ee_event, fromtask,
 					 found_empty_string ? IM_PROTOCOL_VER : IM_OLD_PROTOCOL_VER);
@@ -6665,6 +7248,7 @@ aterr:
 			goto err;
 	}
 
+// MLIU TODO remember to free allocated memory in done and err
 done:
 	if (reply) {
 		DBPRT(("%s: REPLY %s\n", __func__, dis_emsg[ret]))

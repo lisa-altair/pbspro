@@ -860,6 +860,82 @@ tm_spawn(int argc, char **argv, char **envp,
 	return TM_SUCCESS;
 }
 
+
+/**
+ * @brief
+ *	-Starts <argv>[0] with environment <envp> at <where>.
+ *
+ * @param[in] argc - argument count
+ * @param[in] argv - argument list
+ * @param[in] envp - environment variable list
+ * @param[in] where - a list of job relative nodes
+ * @param[out] tid - task id
+ * @param[out] event - a list of event infos
+ *
+ * @return	int
+ * @retval	TM_SUCCESS	success
+ * @retval	TM_ER*		error
+ *
+ */
+int
+tm_spawn_multi(int argc, char **argv, char **envp,
+		tm_node_id where[], int list_size,  tm_task_id *tid[], tm_event_t *event)
+{
+	char		*cp;
+	int		i, j;
+	int		ret;
+
+	if (!init_done)
+		return TM_BADINIT;
+	if (argc <= 0 || argv == NULL || argv[0] == NULL || *argv[0] == '\0')
+		return TM_ENOTFOUND;
+	if (list_size < 1)
+		return TM_EBADENVIRONMENT; /* is this the correct error to use? */
+
+	*event = new_event();
+	if (startcom(TM_SPAWN_MULTI, *event) != DIS_SUCCESS)
+		return TM_ENOTCONNECTED;
+	/* send list size */
+	if (diswsi(local_conn, list_size) != DIS_SUCCESS)
+		return TM_ENOTCONNECTED;
+
+	/* send where */
+	for (i = 0; i < list_size; i++) {
+		if (diswsi(local_conn, where[i]) != DIS_SUCCESS)  
+			return TM_ENOTCONNECTED;
+	}
+	/* send argc */
+	if (diswsi(local_conn, argc) != DIS_SUCCESS)	
+		return TM_ENOTCONNECTED;
+	/* send argv strings across */
+	for (i=0; i < argc; i++) {
+		cp = argv[i];
+		if (diswcs(local_conn, cp, strlen(cp)) != DIS_SUCCESS)
+			return TM_ENOTCONNECTED;
+	}
+	/* send envp strings across */
+	if (envp != NULL) {
+		for (i=0; (cp = envp[i]) != NULL; i++) {
+#if defined(PBS_SECURITY) && (PBS_SECURITY == KRB5)
+			/* never send KRB5CCNAME; it would rewrite the value on target host */
+			if (strncmp(envp[i], "KRB5CCNAME", strlen("KRB5CCNAME")) == 0)
+				continue;
+#endif
+			if (diswcs(local_conn, cp, strlen(cp)) != DIS_SUCCESS)
+				return TM_ENOTCONNECTED;
+		}
+	}
+	if (diswcs(local_conn, "", 0) != DIS_SUCCESS)
+		return TM_ENOTCONNECTED;
+	dis_flush(local_conn);
+	// MLIU TODO second argument should be the relevant node, since there is mutiple
+	// nodes here I do not know what to put in there, thus the -1, will fix later
+	add_event(*event, -1 , TM_SPAWN_MULTI, (void *)tid);
+
+	return TM_SUCCESS;
+}
+
+
 /**
  * @brief
  *	-Sends a <sig> signal to all the process groups in the task
@@ -1519,6 +1595,17 @@ tm_poll(tm_event_t poll_event, tm_event_t *result_event, int wait, int *tm_errno
 
 		case TM_SPAWN:
 		case TM_ATTACH:
+			tid = disrui(local_conn, &ret);
+			if (ret != DIS_SUCCESS) {
+				DBPRT(("%s: SPAWN failed tid\n", __func__))
+				goto err;
+			}
+			tidp = (tm_task_id *)ep->e_info;
+			*tidp = new_task(tm_jobid, ep->e_node, tid);
+			break;
+
+		// MLIU TODO
+		case TM_SPAWN_MULTI:
 			tid = disrui(local_conn, &ret);
 			if (ret != DIS_SUCCESS) {
 				DBPRT(("%s: SPAWN failed tid\n", __func__))
